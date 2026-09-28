@@ -1,0 +1,115 @@
+# RunHarbor 同步：把外部 Git 仓库（目前支持 Gitee）完整镜像到本组织的同名 GitHub 仓库。
+#
+# 由 RunHarbor 在源仓库收到推送后触发，你也可以在 Actions 页面手动运行。
+# 从哪里拉、推到哪里、用哪把钥匙推，全部写在本仓库的 secret RUNHARBOR_SYNC_<仓库名> 里。
+# 这个 secret 是你在 RunHarbor 控制台里生成、亲手粘贴进来的。
+# RunHarbor 只能告诉这个 workflow「同步哪个目标」，改不了源地址，也拿不到钥匙。
+#
+# 目标仓库是纯镜像：源仓库的分支和标签会原样覆盖过去，只在 GitHub 上存在的分支和标签会被删掉。
+name: RunHarbor 同步
+run-name: 同步 ${{ inputs.target }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 目标仓库名（和本仓库同一组织）
+        required: true
+        type: string
+      secret:
+        description: 同步凭据所在的 secret 名，即 RUNHARBOR_SYNC_ 加上大写的仓库名，非字母数字换成 _
+        required: true
+        type: string
+      source_commit:
+        description: 触发这次同步的源端提交（仅用于记录）
+        required: false
+        type: string
+        default: ''
+      delivery:
+        description: RunHarbor 的投递编号（仅用于记录）
+        required: false
+        type: string
+        default: ''
+
+# 这个 workflow 不用 GITHUB_TOKEN，推送只靠目标仓库的 deploy key。
+permissions: {}
+
+concurrency:
+  group: runharbor-sync-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    # 跑在你自己 AWS 里的 RunHarbor runner 上。同步只需要最小的机器。
+    runs-on: [self-hosted, rh-x64-2vcpu-4gib]
+    timeout-minutes: 60
+    steps:
+      - name: 镜像到 GitHub
+        env:
+          TARGET: ${{ inputs.target }}
+          SECRET_NAME: ${{ inputs.secret }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          CREDENTIAL: ${{ secrets[inputs.secret] }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+
+          [[ "$TARGET" =~ ^[A-Za-z0-9_.-]{1,100}$ && "$TARGET" != "." && "$TARGET" != ".." ]] || fail "目标仓库名不合法：$TARGET"
+          expected="RUNHARBOR_SYNC_$(printf '%s' "$TARGET" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_')"
+          [ "$SECRET_NAME" = "$expected" ] || fail "目标 $TARGET 的凭据应在 secret $expected 里，收到的是 $SECRET_NAME"
+          [ -n "$CREDENTIAL" ] || fail "本仓库没有 secret $SECRET_NAME。请在 RunHarbor 控制台的「代码同步」里重新生成同步凭据并粘贴到这里。"
+
+          line() { printf '%s\n' "$CREDENTIAL" | sed -n "s/^$1=//p" | head -n 1; }
+          [ "$(printf '%s\n' "$CREDENTIAL" | head -n 1)" = "runharbor-sync v1" ] || fail "$SECRET_NAME 不是 RunHarbor 同步凭据（第一行应为 runharbor-sync v1）"
+          source="$(line source)"
+          owned="$(line target)"
+          # 凭据里写着它属于哪个目标。选错 secret 时在这里停下，不会把一个源推进别的仓库。
+          [ "$owned" = "$TARGET" ] || fail "$SECRET_NAME 里的凭据属于 $owned，不属于 $TARGET"
+          [[ "$source" =~ ^(git@gitee\.com:|https://gitee\.com/)[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git$ ]] || fail "不支持的源地址：$source"
+
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          printf '%s\n' "$CREDENTIAL" | sed -n '/^-----BEGIN OPENSSH PRIVATE KEY-----$/,/^-----END OPENSSH PRIVATE KEY-----$/p' > "$work/key"
+          chmod 600 "$work/key"
+          [ -s "$work/key" ] || fail "$SECRET_NAME 里没有私钥"
+
+          # 主机公钥钉死，不在运行时信任首次见到的公钥。
+          # github.com 取自 https://api.github.com/meta ；gitee.com 与 https://help.gitee.com/account/gitees-ssh-key-fingerprints 公布的 ED25519 指纹一致。
+          cat > "$work/known_hosts" <<'HOSTS'
+          github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+          gitee.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEKxHSJ7084RmkJ4YdEi5tngynE8aZe2uEoVVsB/OvYN
+          HOSTS
+          sed -i 's/^[[:space:]]*//' "$work/known_hosts"
+          export GIT_SSH_COMMAND="ssh -F /dev/null -i $work/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$work/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes"
+          export GIT_TERMINAL_PROMPT=0
+
+          git init --quiet --bare "$work/mirror"
+          cd "$work/mirror"
+          echo "从 $source 拉取${SOURCE_COMMIT:+（触发提交 $SOURCE_COMMIT）}"
+          git fetch --quiet --no-tags "$source" '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*' \
+            || fail "从 $source 拉取失败。私有仓库请确认已把同步公钥加到源仓库的「部署公钥」里。"
+          if [ -z "$(git for-each-ref --count=1 refs/heads refs/tags)" ]; then
+            echo "源仓库是空的，没有可同步的内容。"
+            exit 0
+          fi
+          dest="git@github.com:$OWNER/$TARGET.git"
+          echo "推送到 $OWNER/$TARGET"
+          git push --quiet "$dest" '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*' \
+            || fail "推送到 $OWNER/$TARGET 失败（原因见上面 git 的输出）。常见原因：目标仓库不存在；同步公钥没加到它的 Deploy keys，或没勾选 Allow write access。"
+
+          # 删掉源里已经没有的分支和标签。GitHub 不允许删默认分支，遇到时只提醒。
+          default="$(git ls-remote --symref "$dest" HEAD | sed -n 's#^ref: refs/heads/\(.*\)\tHEAD$#\1#p')"
+          stale=()
+          while read -r _ ref; do
+            git show-ref --verify --quiet "$ref" && continue
+            if [ "$ref" = "refs/heads/$default" ]; then
+              echo "::warning::目标仓库的默认分支 $default 在源仓库里不存在，已保留。请在 GitHub 仓库设置里把默认分支改成源仓库的主分支，之后会自动清理。"
+              continue
+            fi
+            stale+=(":$ref")
+          done < <(git ls-remote --heads --tags "$dest" | grep -v '\^{}$')
+          if [ "${#stale[@]}" -gt 0 ]; then
+            git push --quiet "$dest" "${stale[@]}" || fail "清理目标仓库里多余的分支或标签失败（原因见上面 git 的输出）。"
+          fi
+          echo "同步完成：$(git for-each-ref refs/heads | wc -l) 个分支，$(git for-each-ref refs/tags | wc -l) 个标签，清理 ${#stale[@]} 个。"
