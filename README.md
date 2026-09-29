@@ -1,14 +1,14 @@
 # RunHarbor 同步仓库
 
-这个仓库负责把你在 Gitee 上的代码镜像到本组织的同名 GitHub 仓库。镜像推送后，目标仓库自带的 GitHub Actions 会照常触发，并跑在你自己 AWS 里的 RunHarbor runner 上。
+这个仓库负责把你在 Gitee、gitlab.com 或自建 GitLab 上的代码镜像到本组织的 GitHub 仓库。镜像推送后，目标仓库自带的 GitHub Actions 会照常触发，并跑在你自己 AWS 里的 RunHarbor runner 上。
 
 每个组织只需要一个同步仓库，名字必须是 `runharbor-sync`。请按 RunHarbor 控制台「代码同步」页的向导操作，不需要手动修改这个仓库。
 
 ## 它是怎么工作的
 
-1. 你的 Gitee 仓库收到推送后，通过 WebHook 通知 RunHarbor。
+1. 你的源仓库收到推送后，通过 WebHook 通知 RunHarbor。
 2. RunHarbor 让你 AWS 里的 Connector 运行本仓库的 `RunHarbor 同步` workflow，并只告诉它要同步哪个目标仓库。
-3. 这个 workflow 在你自己的 RunHarbor runner 上运行：从 Gitee 拉取全部分支和标签，再用目标仓库的 deploy key 推到 GitHub。
+3. 这个 workflow 在你自己的 RunHarbor runner 上运行：从源仓库拉取全部分支和标签，再用目标仓库的 deploy key 推到 GitHub。
 
 ## 谁能决定从哪拉、推到哪
 
@@ -16,9 +16,10 @@
 
 - 源地址；
 - 目标仓库名；
-- 一把只属于这一个目标仓库的 SSH 私钥。
+- 一把只属于这一个目标仓库的 SSH 私钥；
+- 自建 GitLab 走 SSH 时，还有源站的主机公钥（`known_host=` 行）。workflow 只接受源站这一台主机、这个端口的公钥，不会在运行时信任首次见到的钥匙。github.com、gitee.com、gitlab.com 的主机公钥已经钉在 workflow 里。
 
-对应的公钥由你加到目标仓库的 Deploy keys 里，并勾选写权限。私有的 Gitee 仓库还要把它加到 Gitee 的「部署公钥」里。
+对应的公钥由你加到目标仓库的 Deploy keys 里，并勾选写权限。私有的源仓库还要把它加成只读钥匙：Gitee 是「部署公钥」，GitLab 是 Deploy keys（不要勾 Write permissions）。
 
 RunHarbor 的服务端只能告诉 workflow「同步哪个目标」，既看不到凭据，也改不了源地址。凭据里写明了它属于哪个目标，用错了 secret，workflow 会直接拒绝运行。
 

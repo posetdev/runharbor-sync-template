@@ -1,4 +1,4 @@
-# RunHarbor 同步：把外部 Git 仓库（目前支持 Gitee）完整镜像到本组织的同名 GitHub 仓库。
+# RunHarbor 同步：把外部 Git 仓库（Gitee、gitlab.com 或自建 GitLab）完整镜像到本组织的同名 GitHub 仓库。
 #
 # 由 RunHarbor 在源仓库收到推送后触发，你也可以在 Actions 页面手动运行。
 # 从哪里拉、推到哪里、用哪把钥匙推，全部写在本仓库的 secret RUNHARBOR_SYNC_<仓库名> 里。
@@ -66,7 +66,24 @@ jobs:
           owned="$(line target)"
           # 凭据里写着它属于哪个目标。选错 secret 时在这里停下，不会把一个源推进别的仓库。
           [ "$owned" = "$TARGET" ] || fail "$SECRET_NAME 里的凭据属于 $owned，不属于 $TARGET"
-          [[ "$source" =~ ^(git@gitee\.com:|https://gitee\.com/)[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git$ ]] || fail "不支持的源地址：$source"
+
+          # 源地址只收三种写法：网页地址（http/https）、scp 写法 git@主机:路径、ssh://git@主机[:端口]/路径。
+          # 别的协议（file://、ext:: 等）一律拒绝；路径里不许有 . 或 .. 段。
+          lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+          host_re='[A-Za-z0-9][A-Za-z0-9.-]*'
+          path_re='[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)+\.git'
+          ssh_pattern=''
+          if [[ "$source" =~ ^https?://($host_re)(:[0-9]{1,5})?/$path_re$ ]]; then
+            [[ "$source" == http://* ]] && echo "::warning::源地址是明文 http，传输不加密。私有仓库建议改用 SSH 拉取。"
+          elif [[ "$source" =~ ^git@($host_re):$path_re$ ]]; then
+            ssh_pattern="$(lower "${BASH_REMATCH[1]}")"
+          elif [[ "$source" =~ ^ssh://git@($host_re)(:[0-9]{1,5})?/$path_re$ ]]; then
+            ssh_host="$(lower "${BASH_REMATCH[1]}")"; ssh_port="${BASH_REMATCH[2]#:}"
+            if [ -z "$ssh_port" ] || [ "$ssh_port" = 22 ]; then ssh_pattern="$ssh_host"; else ssh_pattern="[$ssh_host]:$ssh_port"; fi
+          else
+            fail "不支持的源地址：$source"
+          fi
+          [[ "$source" =~ [/:]\.{1,2}(/|\.git$) ]] && fail "源地址的路径不能含 . 或 ..：$source"
 
           work="$(mktemp -d)"
           trap 'rm -rf "$work"' EXIT
@@ -75,20 +92,41 @@ jobs:
           [ -s "$work/key" ] || fail "$SECRET_NAME 里没有私钥"
 
           # 主机公钥钉死，不在运行时信任首次见到的公钥。
-          # github.com 取自 https://api.github.com/meta ；gitee.com 与 https://help.gitee.com/account/gitees-ssh-key-fingerprints 公布的 ED25519 指纹一致。
+          # github.com 取自 https://api.github.com/meta ；gitee.com 与 https://help.gitee.com/account/gitees-ssh-key-fingerprints 公布的 ED25519 指纹一致；
+          # gitlab.com 与 https://docs.gitlab.com/user/gitlab_com/ 公布的 ED25519 指纹 SHA256:eUXGGm1YGsMAS7vkcx6JOJdOGHPem5gQp4taiCfCLB8 一致。
           cat > "$work/known_hosts" <<'HOSTS'
           github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
           gitee.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEKxHSJ7084RmkJ4YdEi5tngynE8aZe2uEoVVsB/OvYN
+          gitlab.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAfuCHKVTjquxvt6CM6tdG4SLp1Btn/nOeHHE5UOzRdf
           HOSTS
           sed -i 's/^[[:space:]]*//' "$work/known_hosts"
+
+          # 自建 GitLab 的主机公钥由你在控制台粘贴、写进凭据的 known_host= 行。只收源站这一台主机、这个端口的行，
+          # 别的主机名一律拒绝，免得凭据替 github.com 之类换钥匙。
+          extra=0
+          while IFS= read -r entry; do
+            [ -n "$entry" ] || continue
+            [ -n "$ssh_pattern" ] || fail "$SECRET_NAME 里有主机公钥，但源地址不走 SSH。请在 RunHarbor 控制台重新生成同步凭据。"
+            read -r entry_host entry_type entry_key entry_rest <<< "$entry"
+            [ "$(lower "$entry_host")" = "$ssh_pattern" ] || fail "$SECRET_NAME 里的主机公钥属于 $entry_host，不是源站 $ssh_pattern"
+            [[ "$entry_type" =~ ^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa)$ && "$entry_key" =~ ^[A-Za-z0-9+/]+={0,2}$ && -z "$entry_rest" ]] \
+              || fail "$SECRET_NAME 里有一行看不懂的主机公钥"
+            printf '%s %s %s\n' "$ssh_pattern" "$entry_type" "$entry_key" >> "$work/known_hosts"
+            extra=$((extra + 1))
+          done < <(printf '%s\n' "$CREDENTIAL" | sed -n 's/^known_host=//p')
+          case "$ssh_pattern" in
+            ''|github.com|gitee.com|gitlab.com) ;;
+            *) [ "$extra" -gt 0 ] || fail "源站 $ssh_pattern 的主机公钥不在 $SECRET_NAME 里。请在 RunHarbor 控制台重新生成同步凭据，并按提示粘贴 ssh-keyscan 的输出。" ;;
+          esac
           export GIT_SSH_COMMAND="ssh -F /dev/null -i $work/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$work/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes"
           export GIT_TERMINAL_PROMPT=0
+          export GIT_ALLOW_PROTOCOL=ssh:https:http
 
           git init --quiet --bare "$work/mirror"
           cd "$work/mirror"
           echo "从 $source 拉取${SOURCE_COMMIT:+（触发提交 $SOURCE_COMMIT）}"
           git fetch --quiet --no-tags "$source" '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*' \
-            || fail "从 $source 拉取失败。私有仓库请确认已把同步公钥加到源仓库的「部署公钥」里。"
+            || fail "从 $source 拉取失败。私有仓库请确认已把同步公钥加到源仓库的只读钥匙里（Gitee 的「部署公钥」、GitLab 的 Deploy keys），SSH 端口和主机公钥与源站一致。"
           if [ -z "$(git for-each-ref --count=1 refs/heads refs/tags)" ]; then
             echo "源仓库是空的，没有可同步的内容。"
             exit 0
